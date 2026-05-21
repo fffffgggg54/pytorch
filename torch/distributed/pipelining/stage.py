@@ -1357,12 +1357,15 @@ class _PipelineStage(_PipelineStageBase):
                 )
             src_stage = self.get_stage_index_of_submod(arg_node.name)
 
+            # Only set requires_grad if training (has_backward) and the input was statically inferred to require gradients.
+            needs_grad = self.has_backward and getattr(placeholder, "requires_grad", False)
+
             # Create metadata directly with correct requires_grad.
             tensor_meta = _TensorMeta(
                 shape=example_value.shape,
                 stride=example_value.stride(),
                 dtype=example_value.dtype,
-                requires_grad=self.has_backward,
+                requires_grad=needs_grad,
             )
 
             logger.debug(
@@ -1373,7 +1376,7 @@ class _PipelineStage(_PipelineStageBase):
                 tensor_meta.dtype,
             )
             buffer = _make_tensor_from_meta(tensor_meta, self.device)
-            if self.has_backward:
+            if needs_grad:
                 buffer.requires_grad_(True)
 
             return _RecvInfo(
@@ -1446,8 +1449,9 @@ class _PipelineStage(_PipelineStageBase):
                     dsts.append(dst_rank)
 
         output_node = self._get_output_node()
+        flat_output_nodes = flatten_args(output_node.args)
         output_vals: tuple[torch.Tensor] = tuple(
-            v.meta["val"] for v in flatten_args(output_node.args)
+            v.meta["val"] for v in flat_output_nodes
         )
         # Reject DTensors and create output metadata directly with
         # correct requires_grad.
@@ -1459,12 +1463,14 @@ class _PipelineStage(_PipelineStageBase):
                     f"DTensor metadata propagation is NOT supported for the traced frontend "
                     f"(_PipelineStage). Use the manual PipelineStage frontend for full DTensor support."
                 )
+            out_node = flat_output_nodes[i]
+            node_req_grad = getattr(out_node, "requires_grad", False)
             output_metas.append(
                 _TensorMeta(
                     shape=val.shape,
                     stride=val.stride(),
                     dtype=val.dtype,
-                    requires_grad=self.has_backward,
+                    requires_grad=self.has_backward and node_req_grad,
                 )
             )
         self._stage_meta.outputs = tuple(output_metas)

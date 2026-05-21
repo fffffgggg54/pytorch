@@ -46,6 +46,130 @@ def get_submod_name(stage_idx: int):
     return "_".join([PP_SUBMOD_PREFIX, str(stage_idx)])
 
 
+def _infer_requires_grad(split_gm: fx.GraphModule):
+    # Helper to check if a submodule has parameters with requires_grad=True
+    def submodule_has_requires_grad_parameters(module: torch.nn.Module) -> bool:
+        return any(p.requires_grad for p in module.parameters())
+
+    # Helper to check if a get_attr node targets a parameter with requires_grad=True
+    def get_attr_requires_grad(module: torch.nn.Module, target: str) -> bool:
+        try:
+            attr = module
+            for atom in target.split('.'):
+                attr = getattr(attr, atom)
+            if isinstance(attr, torch.Tensor) and attr.requires_grad:
+                return True
+        except AttributeError:
+            pass
+        return False
+
+    # Helper to check if a node produces a floating point value
+    def is_floating_point_node(node: fx.Node) -> bool:
+        val = node.meta.get("val")
+        if val is not None:
+            if hasattr(val, "is_floating_point"):
+                return val.is_floating_point()
+            if isinstance(val, (list, tuple)):
+                return any(hasattr(v, "is_floating_point") and v.is_floating_point() for v in val)
+            return False
+        return True
+
+    def get_underlying_graph_module(module: torch.nn.Module) -> fx.GraphModule | None:
+        if isinstance(module, fx.GraphModule):
+            return module
+        if hasattr(module, "graph_module") and isinstance(module.graph_module, fx.GraphModule):
+            return module.graph_module
+        return None
+
+    # Recursive function to propagate requires_grad through any GraphModule (outer or nested)
+    def propagate(gm: fx.GraphModule, placeholder_requires_grad: dict[fx.Node, bool]) -> dict[fx.Node, bool]:
+        node_requires_grad = {}
+
+        for node in gm.graph.nodes:
+            node_req_grad = False
+
+            if node.op == "placeholder":
+                node_req_grad = placeholder_requires_grad.get(node, False)
+
+            elif node.op == "get_attr":
+                if get_attr_requires_grad(gm, node.target):
+                    node_req_grad = True
+
+            elif node.op == "call_module":
+                submod = gm.get_submodule(node.target)
+                child_gm = get_underlying_graph_module(submod)
+                
+                if child_gm is not None:
+                    # Retrieve the requires_grad status of inputs to this call_module node
+                    from ._utils import flatten_args
+                    flat_args = flatten_args(node.args) + flatten_args(list(node.kwargs.values()))
+                    
+                    child_placeholders = [n for n in child_gm.graph.nodes if n.op == "placeholder"]
+                    child_placeholder_req_grad = {}
+                    for ph, arg_val in zip(child_placeholders, flat_args):
+                        arg_req = node_requires_grad.get(arg_val, False) if isinstance(arg_val, fx.Node) else False
+                        child_placeholder_req_grad[ph] = arg_req
+                    
+                    # Recursively propagate through the child GraphModule
+                    child_node_req_grad = propagate(child_gm, child_placeholder_req_grad)
+                    
+                    # Retrieve outputs of child_gm
+                    child_outputs = [n for n in child_gm.graph.nodes if n.op == "output"]
+                    if child_outputs:
+                        child_out_node = child_outputs[0]
+                        flat_child_out = flatten_args(child_out_node.args)
+                        node.submod_flat_outputs_requires_grad = [
+                            child_node_req_grad.get(out_n, False) if isinstance(out_n, fx.Node) else False
+                            for out_n in flat_child_out
+                        ]
+                    else:
+                        node.submod_flat_outputs_requires_grad = []
+                    
+                    if node.submod_flat_outputs_requires_grad:
+                        if len(node.submod_flat_outputs_requires_grad) == 1:
+                            node_req_grad = node.submod_flat_outputs_requires_grad[0]
+                        else:
+                            node_req_grad = any(node.submod_flat_outputs_requires_grad)
+                else:
+                    # Fallback to coarse submodule parameters check
+                    has_params = submodule_has_requires_grad_parameters(submod)
+                    args_req_grad = any(node_requires_grad.get(arg, False) for arg in node.all_input_nodes)
+                    if (has_params or args_req_grad) and is_floating_point_node(node):
+                        node_req_grad = True
+
+            elif node.op == "call_function" and node.target is operator.getitem:
+                src_node = node.args[0]
+                idx = node.args[1]
+                if hasattr(src_node, "submod_flat_outputs_requires_grad") and isinstance(idx, int) and idx < len(src_node.submod_flat_outputs_requires_grad):
+                    node_req_grad = src_node.submod_flat_outputs_requires_grad[idx]
+                else:
+                    node_req_grad = any(node_requires_grad.get(arg, False) for arg in node.all_input_nodes)
+                if node_req_grad and not is_floating_point_node(node):
+                    node_req_grad = False
+
+            elif node.op in ("call_function", "call_method"):
+                args_req_grad = any(node_requires_grad.get(arg, False) for arg in node.all_input_nodes)
+                if args_req_grad and is_floating_point_node(node):
+                    node_req_grad = True
+
+            node_requires_grad[node] = node_req_grad
+            node.requires_grad = node_req_grad
+
+        return node_requires_grad
+
+    # Outer graph placeholder requires_grad determination
+    split_gm_placeholders = {}
+    for node in split_gm.graph.nodes:
+        if node.op == "placeholder":
+            val = node.meta.get("val")
+            req_grad = False
+            if val is not None and getattr(val, "requires_grad", False):
+                req_grad = True
+            split_gm_placeholders[node] = req_grad
+
+    propagate(split_gm, split_gm_placeholders)
+
+
 def _find_loss_from_output_and_spec(output_val, spec_val):
     if spec_val is False:
         return None
@@ -637,6 +761,8 @@ class Pipe(torch.nn.Module):
                 i += 1
             except AttributeError:
                 break
+
+        _infer_requires_grad(self.split_gm)
 
     def forward(self, *args, **kwargs):
         executor_args = args
